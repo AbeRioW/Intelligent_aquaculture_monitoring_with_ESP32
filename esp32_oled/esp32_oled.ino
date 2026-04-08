@@ -1,12 +1,28 @@
-
 #include <Wire.h>
 #include "SSD1306.h"
 #include "DS18B20.h"
 #include <Preferences.h>
+#include <WiFi.h>      // ESP32 WiFi库
+#include <PubSubClient.h>       // MQTT客户端库
 
 Preferences preferences;
 
 SSD1306 display(0x3c, 21, 22);
+
+// WiFi配置
+const char* ssid = "jingda830";      // WiFi名称
+const char* password = "jd717718"; // WiFi密码
+
+// OneNet MQTT配置
+const char* mqttServer = "mqtts.heclouds.com"; // OneNet MQTT服务器地址
+const int mqttPort = 1883;                // OneNet MQTT端口
+const char* mqttClientId = "esp32_oled"; // 设备ID
+const char* mqttUser = "dU5jVg1L9b";     // 产品ID
+const char* mqttPassword = "version=2018-10-31&res=products%2FdU5jVg1L9b%2Fdevices%2Fesp32_oled&et=2810377042&method=md5&sign=1wRzfPZDjJ6ztNqWYY9lIg%3D%3D"; // API密钥
+
+// WiFi和MQTT客户端
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 #define TURBIDITY_PIN 35
 #define PH_PIN 34
@@ -31,7 +47,15 @@ bool key2LastState = HIGH;
 bool key3State = HIGH;
 bool key3LastState = HIGH;
 
+// 函数声明
+void setupWiFi();         // WiFi连接设置
+void connectMQTT();       // 连接到MQTT服务器
+void mqttCallback(char* topic, byte* payload, unsigned int length); // MQTT消息回调
+void sendSensorData();    // 发送传感器数据到OneNet
+
 void setup() {
+  Serial.begin(115200);
+  
   display.init();
   display.flipScreenVertically();
   
@@ -53,6 +77,16 @@ void setup() {
   display.drawString(0, 0, "Initializing sensors...");
   display.display();
   delay(2000);
+  
+  // 设置WiFi
+  setupWiFi();
+  
+  // 配置MQTT客户端
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(mqttCallback);
+  
+  // 连接到MQTT服务器
+  connectMQTT();
 }
 
 float readTemperature() {
@@ -68,6 +102,12 @@ int readPH() {
 }
 
 void loop() {
+  // 保持MQTT连接
+  if (!client.connected()) {
+    connectMQTT();
+  }
+  client.loop();
+  
   // 读取按键状态
   key1State = digitalRead(KEY1_PIN);
   key2State = digitalRead(KEY2_PIN);
@@ -194,5 +234,116 @@ void loop() {
   }
   
   display.display();
+  
+  // 定期发送传感器数据到OneNet
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend > 2000) {
+    sendSensorData();
+    lastSend = millis();
+  }
+  
   delay(100); // 增加刷新频率
+}
+
+/**
+ * WiFi连接设置
+ * 连接到指定的WiFi网络
+ */
+void setupWiFi() {
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password); // 开始连接WiFi
+  
+  // 等待WiFi连接成功
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP()); // 打印IP地址
+}
+
+/**
+ * 连接到MQTT服务器
+ * 建立与OneNet MQTT服务的连接
+ */
+void connectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect(mqttClientId, mqttUser, mqttPassword)) {
+      Serial.println("connected");
+      // 订阅命令主题
+      String cmdTopic = "$sys/" + String(mqttUser) + "/" + String(mqttClientId) + "/cmd/request/#";
+      client.subscribe(cmdTopic.c_str());
+      Serial.print("Subscribed to: ");
+      Serial.println(cmdTopic);
+      
+      // 连接成功后立即发送传感器数据
+      sendSensorData();
+      Serial.println("Initial sensor data sent after MQTT connection");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+/**
+ * MQTT消息回调函数
+ * 处理从OneNet接收到的命令
+ */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+  
+  // 解析JSON命令
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  // 这里可以添加命令处理逻辑
+  // 例如：切换模式、调整阈值等
+}
+
+/**
+ * 发送传感器数据到OneNet云平台
+ * 使用MQTT协议上传传感器数据
+ */
+void sendSensorData() {
+  // 读取传感器数据
+  float temperature = readTemperature();
+  int turbidity = readTurbidity();
+  int phValue = readPH();
+  
+  // 构建JSON字符串
+  String json = "{\"id\":\"123\",\"params\":{";
+  json += "\"temperature\":{\"value\":" + String(temperature) + "},";
+  json += "\"turbidity\":{\"value\":" + String(turbidity) + "},";
+  json += "\"ph\":{\"value\":" + String(phValue) + "}";
+  json += "}}";
+  
+  // 发布数据到OneNet设备接入平台
+  String topic = "$sys/" + String(mqttUser) + "/" + String(mqttClientId) + "/thing/property/post";
+  
+  if (client.publish(topic.c_str(), json.c_str())) {
+    Serial.println("Data sent to OneNet successfully");
+    Serial.print("Topic: ");
+    Serial.println(topic);
+    Serial.print("Payload: ");
+    Serial.println(json);
+  } else {
+    Serial.println("Failed to send data to OneNet");
+  }
 }
